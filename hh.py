@@ -4,8 +4,9 @@ import pandas as pd
 from fast_alpr import ALPR
 from openpyxl import load_workbook
 import tkinter as tk
-from tkinter import messagebox
 import threading
+from collections import deque
+from datetime import datetime
 
 # تحقق من وجود الفيديو
 video_path = "video_2025-01-18_20-27-35.mp4"
@@ -13,155 +14,240 @@ if not os.path.exists(video_path):
     print(f"Error: Video file not found at {video_path}")
     exit()
 
-# تحقق من وجود ملف Excel الأول (حفظ الأرقام المكتشفة)
+# تحقق من وجود ملفات Excel
 excel_path_1 = "detected_numbers.xlsx"
-if not os.path.exists(excel_path_1):
-    print(f"Error: Excel file not found at {excel_path_1}")
-    exit()
-
-# تحقق من وجود ملف Excel الثاني (معلومات الأرقام)
 excel_path_2 = "car_info.xlsx"
-if not os.path.exists(excel_path_2):
-    print(f"Error: Excel file not found at {excel_path_2}")
+if not os.path.exists(excel_path_1) or not os.path.exists(excel_path_2):
+    print("Error: Excel files not found")
     exit()
 
-# قراءة ملف Excel الأول (لحفظ الأرقام المكتشفة)
+
+
+
+def check_third_excel(plate_number, excel_path_3="blocked_plates.xlsx"):
+    if not os.path.exists(excel_path_3):
+        print(f"Error: ملف Excel الثالث غير موجود في {excel_path_3}")
+        return False
+
+    wb_3 = load_workbook(excel_path_3)
+    ws_3 = wb_3.active
+
+    normalized_plate = str(plate_number).strip().lower()
+    print(f"البحث عن الرقم: {normalized_plate} في {excel_path_3}")
+
+    for row in ws_3.iter_rows(min_row=1, max_col=1):
+        cell_value = row[0].value
+        if cell_value is not None:
+            cell_normalized = str(cell_value).strip().lower()
+            print(f"مقارنة مع: {cell_normalized}")
+            if cell_normalized == normalized_plate:
+                print("تم العثور على الرقم في ملف Excel الثالث.")
+                return True
+    return False
+
+# تهيئة ملفات Excel
 wb_1 = load_workbook(excel_path_1)
 ws_1 = wb_1.active
-
-# قراءة ملف Excel الثاني (معلومات الأرقام)
 wb_2 = load_workbook(excel_path_2)
 ws_2 = wb_2.active
 
-# تهيئة ALPR
+# تهيئة نظام التعرف على اللوحات
 alpr = ALPR(
     detector_model="yolo-v9-t-384-license-plate-end2end",
     ocr_model="global-plates-mobile-vit-v2-model",
 )
 
-# فتح الفيديو
+# تهيئة الفيديو
 cap = cv2.VideoCapture(video_path)
 if not cap.isOpened():
     print("Error: Could not open video.")
     exit()
 
-# دالة للتحقق إذا كان رقم اللوحة موجود في ملف Excel الأول
+# الحصول على مواصفات الفيديو
+fps = cap.get(cv2.CAP_PROP_FPS)
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+frame_size = (width, height)
+
+# إعدادات التسجيل
+pre_detection_seconds = 5  # الثواني المراد تسجيلها قبل الكشف
+post_detection_seconds = 2  # الثواني المراد تسجيلها بعد الكشف
+buffer_size = int(fps * pre_detection_seconds)
+buffer = deque(maxlen=buffer_size)
+
+# متغيرات التحكم بالتسجيل
+pending_recording = False
+recording = False
+recording_plate = None
+post_frames_needed = 0
+clip_frames = []
+
+
+# دالة لحفظ المقاطع
+def save_clip(frames, fps, frame_size, plate_number):
+    if not frames:
+        return
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"clip_{plate_number}_{timestamp}.mp4" if plate_number else f"clip_{timestamp}.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(filename, fourcc, fps, frame_size)
+    for frame in frames:
+        out.write(frame)
+    out.release()
+    print(f"تم حفظ المقطع: {filename}")
+
+
+# دالة التحقق من وجود الرقم
 def is_plate_number_exist(plate_number):
-    for row in ws_1.iter_rows(min_row=2, max_row=ws_1.max_row, min_col=1, max_col=1):
+    for row in ws_1.iter_rows(min_row=2, max_col=1):
         if row[0].value == plate_number:
             return True
     return False
 
-# دالة للتحقق إذا كان رقم اللوحة موجود في ملف Excel الثاني
+
+# دالة حفظ الرقم الجديد
+def save_plate_number(plate_number):
+    if not is_plate_number_exist(plate_number):
+        ws_1.append([plate_number])
+        wb_1.save(excel_path_1)
+        print(f"تم حفظ الرقم: {plate_number}")
+        return True
+    else:
+        print(f"الرقم موجود مسبقًا: {plate_number}")
+        return False
+
+
+# دالة للحصول على معلومات المركبة من ملف Excel الثاني
 def get_car_info(plate_number):
-    for row in ws_2.iter_rows(min_row=2, max_row=ws_2.max_row, min_col=1, max_col=1):
-        if row[0].value == plate_number:  # تحقق من الرقم في العمود الأول
-            # إرجاع كافة المعلومات من الأعمدة الأخرى بعد الرقم
-            return [ws_2.cell(row=row[0].row, column=col).value for col in range(2, ws_2.max_column + 1)]
+    for row in ws_2.iter_rows(min_row=2, max_col=ws_2.max_column):
+        if row[0].value == plate_number:
+            return [cell.value for cell in row[1:]]  # إرجاع جميع الأعمدة بعد الرقم
     return None
 
-# دالة لحفظ الرقم في ملف Excel الأول
-def save_plate_number(plate_number):
-    # تحقق إذا كان الرقم موجود مسبقًا في الملف
-    if not is_plate_number_exist(plate_number):
-        last_row = ws_1.max_row + 1
-        ws_1[f"A{last_row}"] = plate_number
-        wb_1.save(excel_path_1)
-        print(f"The number has been saved.={plate_number}")
-    else:
-        print(f"The number is available={plate_number}")
 
-# متغير لتخزين النافذة
+
+
+# تعريف المتغير العام
 info_window = None
 
-# دالة لإنشاء أو تحديث نافذة المعلومات
-def update_car_info_window(info):
+def update_car_info_window(info, plate_number):
     global info_window
-    if info_window is None:
-        # إنشاء نافذة جديدة
+    if info_window is None or not info_window.winfo_exists():
         info_window = tk.Toplevel()
-        info_window.title("Car Information")
-        info_window.geometry("400x300")
+        info_window.title("information of car")
+        info_window.geometry("600x300")  # زيادة العرض ليستوعب الشريط الجانبي
+    else:
+        # تنظيف النافذة من الودجات السابقة
+        for widget in info_window.winfo_children():
+            widget.destroy()
 
-        # إضافة العناوين للأعمدة
-        label = tk.Label(info_window, text="Car Information")
-        label.grid(row=0, column=1)
+    # إنشاء إطار رئيسي لتقسيم النافذة إلى قسمين: معلومات المركبة والشريط الجانبي
+    main_frame = tk.Frame(info_window)
+    main_frame.pack(fill=tk.BOTH, expand=True)
 
-    # إذا كانت المعلومات فارغة (رقم اللوحة غير موجود)، إظهار رسالة
-    if info is None:
-        info = ["The number is not available"]
+    # الإطار الأيسر لعرض معلومات المركبة
+    info_frame = tk.Frame(main_frame)
+    info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    # تحديث البيانات في الأعمدة
-    for widget in info_window.winfo_children():
-        widget.destroy()  # إزالة جميع العناصر السابقة
+    if info:
+        for idx, data in enumerate(info, start=1):
+            tk.Label(info_frame, text=f"Information {idx}: {data}", font=("Arial", 12)).pack(anchor="w", pady=2)
+    else:
+        tk.Label(info_frame, text="The number is not registered", font=("Arial", 12)).pack(anchor="w", pady=2)
 
-    # تحديث المحتوى بناءً على البيانات الجديدة
-    for idx, data in enumerate(info, start=1):
-        label = tk.Label(info_window, text=data)
-        label.grid(row=1, column=idx)
+    # الإطار الأيمن كشريط جانبي
+    # اللون الافتراضي هو الأخضر
+    sidebar_color = "green"
+    # التحقق من ملف Excel الثالث لتغيير اللون إلى الأحمر في حال وجود الرقم
+    if check_third_excel(plate_number):
+        sidebar_color = "red"  # تغيير اللون إلى الأحمر عند تحقق الشرط
+        sidebar_frame = tk.Frame(main_frame, width=100, bg=sidebar_color)
+        sidebar_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        sidebar_frame.pack_propagate(False)
+        tk.Label(sidebar_frame, text="warning", bg=sidebar_color, fg="white", font=("Arial", 14)).pack(pady=20)
+        print("reeeeeed")
+    else:
+        # في حالة عدم تحقق الشرط، يتم إنشاء الشريط الجانبي بنفس اللون الافتراضي
+        sidebar_frame = tk.Frame(main_frame, width=100, bg=sidebar_color)
+        sidebar_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        sidebar_frame.pack_propagate(False)  # لمنع تغيير الحجم بناءً على المحتوى
+        tk.Label(sidebar_frame, text="safety", bg=sidebar_color, fg="white", font=("Arial", 14)).pack(pady=20)
+    # يمكن إضافة محتويات إضافية داخل الشريط الجانبي إذا لزم الأمر
 
-# دالة لعرض الفيديو ومعالجة التنبؤات
+
 def process_video():
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                # إعادة تشغيل الفيديو عند انتهائه
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
+    global pending_recording, recording, recording_plate, post_frames_needed, clip_frames
 
-            # الكشف عن اللوحات
-            alpr_results = alpr.predict(frame)
-            # استخراج الرقم وإضافته إلى متغير
-            detected_plate_number = None
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
 
-            for result in alpr_results:
-                if hasattr(result, "ocr"):
-                    detected_plate_number = result.ocr.text
-                    break  # إيقاف التكرار إذا كنت تحتاج فقط إلى أول رقم
+        # معالجة الإطار ورسم التحديدات
+        annotated_frame = alpr.draw_predictions(frame)
+        buffer.append(annotated_frame)
 
-            # طباعة المتغير للتأكد
-            print(f"Detected Plate Number: {detected_plate_number}")
-
-            if detected_plate_number:
-                # حفظ الرقم في ملف Excel الأول فقط إذا لم يكن موجودًا
-                save_plate_number(detected_plate_number)
-
-                # الحصول على المعلومات من ملف Excel الثاني
-                car_info = get_car_info(detected_plate_number)
-
-                # تحديث نافذة المعلومات مع البيانات الجديدة أو عرض "The number is not available"
-                update_car_info_window(car_info)
-
-            # رسم التنبؤات على الإطار
-            annotated_frame = alpr.draw_predictions(frame)
-
-            # عرض الفيديو مع التنبؤات
-            cv2.imshow("ALPR Video", annotated_frame)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):  # إيقاف الفيديو عند الضغط على 'q'
+        # الكشف عن اللوحات
+        detected_plate = None
+        results = alpr.predict(frame)
+        for res in results:
+            if hasattr(res, "ocr"):
+                detected_plate = res.ocr.text
                 break
 
-    except Exception as e:
-        print(f"Error during processing: {e}")
+        if detected_plate:
+            # حفظ الرقم إذا لم يكن موجودًا مسبقًا
+            is_new = save_plate_number(detected_plate)
+            if is_new and not recording and not pending_recording:
+                pending_recording = True
+                recording_plate = detected_plate
+                clip_frames = list(buffer)
+                post_frames_needed = int(fps * post_detection_seconds)
 
-    finally:
-        # تحرير الموارد
-        cap.release()
-        cv2.destroyAllWindows()
+            # الحصول على معلومات المركبة وتحديث الواجهة
+            car_info = get_car_info(detected_plate)
+            update_car_info_window(car_info, detected_plate)
 
-# دالة لتشغيل واجهة Tkinter
-def run_tkinter():
-    main_window = tk.Tk()
-    main_window.withdraw()  # إخفاء النافذة الرئيسية
-    main_window.mainloop()
+        # بدء التسجيل إذا كان مطلوبًا
+        if pending_recording:
+            recording = True
+            pending_recording = False
 
-# تشغيل Tkinter في Thread منفصل
-thread_tkinter = threading.Thread(target=run_tkinter)
-thread_tkinter.daemon = True  # جعلها تعمل كـ daemon
-thread_tkinter.start()
+        # إدارة عملية التسجيل
+        if recording:
+            clip_frames.append(annotated_frame)
+            post_frames_needed -= 1
+            if post_frames_needed <= 0:
+                save_clip(clip_frames, fps, frame_size, recording_plate)
+                recording = False
+                recording_plate = None
+                clip_frames = []
 
-# تشغيل الفيديو ومعالجة التنبؤات
+        # عرض الفيديو
+        cv2.imshow("نظام التعرف على اللوحات", annotated_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# تشغيل واجهة المستخدم
+def run_gui():
+    root = tk.Tk()
+    root.withdraw()
+    root.mainloop()
+
+
+# تشغيل الخيوط
+threading.Thread(target=run_gui, daemon=True).start()
 process_video()
 
-print("تم إيقاف تشغيل الفيديو.")
+
+
+
+
+
+
+
